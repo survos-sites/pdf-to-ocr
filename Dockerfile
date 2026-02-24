@@ -16,5 +16,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Dokku sets PORT env var
-EXPOSE 5000
 CMD uvicorn app:app --host 0.0.0.0 --port ${PORT:-5000}
