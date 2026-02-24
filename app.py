@@ -1,104 +1,143 @@
 import os
+import hashlib
 import tempfile
 import httpx
 import fitz  # PyMuPDF
 import ocrmypdf
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pathlib import Path
 
 app = FastAPI(title="PDF to OCR Service")
 
-TEMP_DIR = tempfile.mkdtemp()
+CACHE_DIR = Path(tempfile.mkdtemp())
+
+
+def _cache_key(url: str) -> str:
+    """Consistent cache key from URL."""
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def _download_pdf(url: str) -> Path:
+    """Download a PDF and cache locally. Returns path to raw file."""
+    key = _cache_key(url)
+    raw_path = CACHE_DIR / f"{key}_raw.pdf"
+    if raw_path.exists():
+        return raw_path
+    try:
+        with httpx.Client(timeout=120, follow_redirects=True) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+        raw_path.write_bytes(resp.content)
+        return raw_path
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download PDF: {e}")
+
+
+def _ensure_ocr(url: str) -> Path:
+    """Download + OCR a PDF. Returns path to searchable PDF."""
+    key = _cache_key(url)
+    ocr_path = CACHE_DIR / f"{key}_ocr.pdf"
+    if ocr_path.exists():
+        return ocr_path
+
+    raw_path = _download_pdf(url)
+    try:
+        ocrmypdf.ocr(
+            str(raw_path),
+            str(ocr_path),
+            deskew=True,
+            skip_text=True,
+            optimize=2,
+            language=os.environ.get("OCR_LANGUAGE", "eng"),
+        )
+    except ocrmypdf.exceptions.PriorOcrFoundError:
+        # Already has text layer — just copy it
+        ocr_path.write_bytes(raw_path.read_bytes())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
+
+    return ocr_path
 
 
 @app.get("/")
 def index():
-    return {"status": "ok", "usage": "GET /?url=https://example.com/scan.pdf"}
+    return {
+        "status": "ok",
+        "endpoints": {
+            "/ocr?url=": "Returns searchable PDF",
+            "/text?url=": "Returns JSON with per-page text",
+            "/page-image?url=&page=1&dpi=200": "Returns a page as PNG",
+            "/thumbnail?url=&page=1": "Returns a low-res page thumbnail",
+        },
+    }
 
 
 @app.get("/ocr")
 def ocr_pdf(url: str = Query(..., description="URL of PDF to OCR")):
     """Download a PDF, run OCRmyPDF, return the searchable PDF."""
-    try:
-        # Download the PDF
-        with httpx.Client(timeout=120, follow_redirects=True) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-
-        input_path = os.path.join(TEMP_DIR, "input.pdf")
-        output_path = os.path.join(TEMP_DIR, "output.pdf")
-
-        with open(input_path, "wb") as f:
-            f.write(resp.content)
-
-        # Run OCRmyPDF
-        ocrmypdf.ocr(
-            input_path,
-            output_path,
-            deskew=True,
-            skip_text=True,
-            optimize=2,
-            language="eng",
-        )
-
-        return FileResponse(
-            output_path,
-            media_type="application/pdf",
-            filename="ocr-result.pdf",
-        )
-
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download PDF: {e}")
-    except ocrmypdf.exceptions.PriorOcrFoundError:
-        # PDF already has OCR text, return it as-is
-        return FileResponse(input_path, media_type="application/pdf")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    ocr_path = _ensure_ocr(url)
+    return FileResponse(
+        ocr_path,
+        media_type="application/pdf",
+        filename="ocr-result.pdf",
+    )
 
 
 @app.get("/text")
-def extract_text(url: str = Query(..., description="URL of PDF to extract text from")):
-    """Download a PDF, run OCR if needed, return extracted text per page."""
-    try:
-        with httpx.Client(timeout=120, follow_redirects=True) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
+def extract_text(url: str = Query(..., description="URL of PDF")):
+    """OCR if needed, then return extracted text per page as JSON."""
+    ocr_path = _ensure_ocr(url)
+    doc = fitz.open(str(ocr_path))
+    pages = []
+    for i, page in enumerate(doc):
+        text = page.get_text().strip()
+        pages.append({"page": i + 1, "text": text})
+    doc.close()
 
-        input_path = os.path.join(TEMP_DIR, "input.pdf")
-        output_path = os.path.join(TEMP_DIR, "output.pdf")
+    return JSONResponse({
+        "url": url,
+        "page_count": len(pages),
+        "pages": pages,
+    })
 
-        with open(input_path, "wb") as f:
-            f.write(resp.content)
 
-        # OCR first
-        try:
-            ocrmypdf.ocr(
-                input_path,
-                output_path,
-                deskew=True,
-                skip_text=True,
-                optimize=2,
-                language="eng",
-            )
-            pdf_path = output_path
-        except ocrmypdf.exceptions.PriorOcrFoundError:
-            pdf_path = input_path
-
-        # Extract text with PyMuPDF
-        doc = fitz.open(pdf_path)
-        pages = []
-        for i, page in enumerate(doc):
-            text = page.get_text().strip()
-            pages.append({"page": i + 1, "text": text})
+@app.get("/page-image")
+def page_image(
+    url: str = Query(..., description="URL of PDF"),
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+    dpi: int = Query(200, ge=72, le=600, description="Resolution"),
+):
+    """Render a single page of the OCR'd PDF as a PNG."""
+    ocr_path = _ensure_ocr(url)
+    doc = fitz.open(str(ocr_path))
+    if page > len(doc):
         doc.close()
+        raise HTTPException(
+            status_code=404,
+            detail=f"Page {page} not found (PDF has {len(doc)} pages)",
+        )
+    pix = doc[page - 1].get_pixmap(dpi=dpi)
+    png_bytes = pix.tobytes("png")
+    doc.close()
+    return Response(content=png_bytes, media_type="image/png")
 
-        return JSONResponse({
-            "url": url,
-            "page_count": len(pages),
-            "pages": pages,
-        })
 
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download PDF: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/thumbnail")
+def thumbnail(
+    url: str = Query(..., description="URL of PDF"),
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+):
+    """Low-res thumbnail (72 DPI) of a page."""
+    ocr_path = _ensure_ocr(url)
+    doc = fitz.open(str(ocr_path))
+    if page > len(doc):
+        doc.close()
+        raise HTTPException(
+            status_code=404,
+            detail=f"Page {page} not found (PDF has {len(doc)} pages)",
+        )
+    pix = doc[page - 1].get_pixmap(dpi=72)
+    png_bytes = pix.tobytes("png")
+    doc.close()
+    return Response(content=png_bytes, media_type="image/png")
