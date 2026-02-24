@@ -2,4 +2,5 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 httpx==0.28.1
 ocrmypdf==16.8.0
+pikepdf<10
 pymupdf==1.25.3
