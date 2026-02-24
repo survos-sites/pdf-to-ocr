@@ -73,6 +73,15 @@ def index():
     }
 
 
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "pdf-to-ocr",
+        "cache_dir": str(CACHE_DIR),
+    }
+
+
 @app.get("/ocr")
 def ocr_pdf(url: str = Query(..., description="URL of PDF to OCR")):
     """Download a PDF, run OCRmyPDF, return the searchable PDF."""
