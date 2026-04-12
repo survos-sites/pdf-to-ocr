@@ -2,15 +2,25 @@ import os
 import hashlib
 import tempfile
 import httpx
+import img2pdf
 import fitz  # PyMuPDF
 import ocrmypdf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pathlib import Path
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="PDF to OCR Service")
 
 CACHE_DIR = Path(tempfile.mkdtemp())
+
+
+class MaterializeRequest(BaseModel):
+    image_urls: list[str] = Field(..., min_length=1)
+    title: str | None = None
+    author: str | None = None
+    keywords: str | None = None
+    language: str | None = None
 
 
 def _cache_key(url: str) -> str:
@@ -32,6 +42,16 @@ def _download_pdf(url: str) -> Path:
         return raw_path
     except httpx.HTTPError as e:
         raise HTTPException(status_code=400, detail=f"Failed to download PDF: {e}")
+
+
+def _download_file(url: str, dest_path: Path, kind: str) -> None:
+    try:
+        with httpx.Client(timeout=120, follow_redirects=True) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+        dest_path.write_bytes(resp.content)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download {kind}: {e}")
 
 
 def _ensure_ocr(url: str) -> Path:
@@ -66,6 +86,7 @@ def index():
         "status": "ok",
         "endpoints": {
             "/ocr?url=": "Returns searchable PDF",
+            "POST /materialize": "Builds a searchable PDF/A from ordered JPG URLs",
             "/text?url=": "Returns JSON with per-page text",
             "/page-image?url=&page=1&dpi=200": "Returns a page as PNG",
             "/thumbnail?url=&page=1": "Returns a low-res page thumbnail",
@@ -91,6 +112,59 @@ def ocr_pdf(url: str = Query(..., description="URL of PDF to OCR")):
         media_type="application/pdf",
         filename="ocr-result.pdf",
     )
+
+
+@app.post("/materialize")
+def materialize_pdfa(payload: MaterializeRequest):
+    """Build a PDF/A from ordered JPG URLs, then OCR it into a searchable PDF."""
+    language = payload.language or os.environ.get("OCR_LANGUAGE", "eng")
+    temp_dir = Path(tempfile.mkdtemp())
+
+    try:
+        image_paths = []
+        for i, image_url in enumerate(payload.image_urls):
+            image_path = temp_dir / f"page_{i:04d}.jpg"
+            _download_file(image_url, image_path, f"image {i + 1}")
+            image_paths.append(image_path)
+
+        raw_pdf_path = temp_dir / "materialized_raw.pdf"
+        raw_pdf_path.write_bytes(
+            img2pdf.convert([str(image_path) for image_path in image_paths])
+        )
+
+        output_pdf_path = temp_dir / "materialized_pdfa.pdf"
+        ocr_kwargs = {
+            "output_type": "pdfa-2",
+            "deskew": True,
+            "rotate_pages": True,
+            "clean_final": True,
+            "optimize": 2,
+            "language": language,
+        }
+        if payload.title:
+            ocr_kwargs["title"] = payload.title
+        if payload.author:
+            ocr_kwargs["author"] = payload.author
+        if payload.keywords:
+            ocr_kwargs["keywords"] = payload.keywords
+
+        ocrmypdf.ocr(
+            str(raw_pdf_path),
+            str(output_pdf_path),
+            **ocr_kwargs,
+        )
+
+        return Response(
+            content=output_pdf_path.read_bytes(),
+            media_type="application/pdf",
+            headers={"Content-Disposition": 'inline; filename="materialized.pdf"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Materialization failed: {e}")
+    finally:
+        for path in temp_dir.glob("*"):
+            path.unlink(missing_ok=True)
+        temp_dir.rmdir()
 
 
 @app.get("/text")

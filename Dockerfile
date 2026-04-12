@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr-spa \
     ghostscript \
     pngquant \
-    jbig2 \
+    unpaper \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
